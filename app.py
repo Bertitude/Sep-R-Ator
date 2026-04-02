@@ -125,6 +125,15 @@ class App(ctk.CTk):
             width=160,
             command=self._on_device_change,
         ).pack(side="left")
+        # Shows what "Auto" actually resolved to
+        _resolved = self.processor.device.upper()
+        self._device_status = ctk.CTkLabel(
+            device_frame,
+            text=f"({_resolved})",
+            font=ctk.CTkFont(size=11),
+            text_color="#4CAF50" if _resolved == "CUDA" else "gray",
+        )
+        self._device_status.pack(side="left", padx=(6, 0))
 
         # Tab view
         self._tabs = ctk.CTkTabview(self, width=660, height=320)
@@ -337,6 +346,11 @@ class App(ctk.CTk):
             self.processor.device = "cpu"
         else:  # Auto
             self.processor.device = "cuda" if _torch.cuda.is_available() else "cpu"
+        resolved = self.processor.device.upper()
+        self._device_status.configure(
+            text=f"({resolved})",
+            text_color="#4CAF50" if resolved == "CUDA" else "gray",
+        )
 
     # ------------------------------------------------------------------
     # Generic threaded runner
