@@ -101,15 +101,52 @@ class SepReformerProcessor:
         # Patch Python 3.9 compatibility: @dataclass(slots=True) requires 3.10+
         self._patch_py39_compat()
 
+    def _write_cpu_wrapper(self) -> None:
+        """Write a small shim into SepReformer/ that redirects cuda:* → cpu.
+
+        Called unconditionally so the wrapper is always present; the wrapper
+        itself checks torch.cuda.is_available() at runtime before patching.
+        """
+        wrapper = SEPREFORMER_DIR / "_sep_r_ator_cpu_wrapper.py"
+        wrapper.write_text(
+            '"""CPU shim: redirect cuda:* → cpu when CUDA is unavailable."""\n'
+            "import runpy, sys, torch as _torch\n"
+            "\n"
+            "if not _torch.cuda.is_available():\n"
+            "    _orig_device = _torch.device\n"
+            "    def _cpu_device(type_or_device='cpu', index=None):\n"
+            "        if isinstance(type_or_device, str) and type_or_device.startswith('cuda'):\n"
+            "            return _orig_device('cpu')\n"
+            "        if index is not None:\n"
+            "            return _orig_device(type_or_device, index)\n"
+            "        return _orig_device(type_or_device)\n"
+            "    _torch.device = _cpu_device\n"
+            "\n"
+            "    # Also patch torch.cuda.current_device / is_available used inside SepReformer\n"
+            "    _torch.cuda.current_device = lambda: 0\n"
+            "    import torch.nn as _nn\n"
+            "    _orig_cuda = _nn.Module.cuda\n"
+            "    _nn.Module.cuda = lambda self, device=None: self  # no-op .cuda() calls\n"
+            "    _torch.Tensor.cuda = lambda self, device=None: self\n"
+            "\n"
+            "sys.argv[0] = 'run.py'\n"
+            "runpy.run_path('run.py', run_name='__main__')\n",
+            encoding="utf-8",
+        )
+
     def _patch_py39_compat(self) -> None:
         """Replace @dataclass(slots=True) → @dataclass() in SepReformer source.
 
         The slots=True parameter was added in Python 3.10. Removing it has no
         effect on correctness — it only disables the memory-layout optimisation.
         """
+        # Always (re)write the CPU wrapper so it's present regardless of Python version.
+        if SEPREFORMER_DIR.exists():
+            self._write_cpu_wrapper()
+
         import sys as _sys
         if _sys.version_info >= (3, 10):
-            return  # not needed on 3.10+
+            return  # slots patch not needed on 3.10+
         for py_file in SEPREFORMER_DIR.rglob("*.py"):
             try:
                 text = py_file.read_text(encoding="utf-8")
@@ -120,9 +157,6 @@ class SepReformerProcessor:
                     )
             except Exception:
                 pass
-
-        if progress_cb:
-            progress_cb("Setup complete.")
 
     # ------------------------------------------------------------------
     # Audio helpers
@@ -185,9 +219,18 @@ class SepReformerProcessor:
             # Prevent CUDA use even if a GPU is present
             env["CUDA_VISIBLE_DEVICES"] = ""
 
+        # Use the CPU wrapper when device is CPU so that SepReformer's hard-coded
+        # cuda:0 device (from configs.yaml gpuid:'0') is transparently redirected
+        # to CPU — avoids AssertionError on CPU-only PyTorch builds.
+        entry_script = (
+            "_sep_r_ator_cpu_wrapper.py"
+            if self.device == "cpu"
+            else "run.py"
+        )
+
         subprocess.run(
             [
-                sys.executable, "run.py",
+                sys.executable, entry_script,
                 "--model", MODEL_NAME,
                 "--engine-mode", "infer_sample",
                 "--sample-file", str(input_wav),
