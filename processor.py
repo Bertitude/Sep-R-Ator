@@ -107,98 +107,95 @@ class SepReformerProcessor:
         self._patch_py39_compat()
 
     def _write_cpu_wrapper(self) -> None:
-        """Write a small shim into SepReformer/ that forces CPU mode.
+        """Write a small shim into SepReformer/ for CPU-only torch.load safety.
 
-        Called unconditionally so the wrapper is always present; the wrapper
-        itself checks torch.cuda.is_available() at runtime before patching.
+        The heavy lifting (device creation) is handled by the source-level
+        patch in _patch_py39_compat(). This wrapper only needs to ensure
+        GPU-saved checkpoints load onto CPU via a torch.load redirect.
         """
         wrapper = SEPREFORMER_DIR / "_sep_r_ator_cpu_wrapper.py"
         wrapper.write_text(
-            '"""CPU shim: force SepReformer into CPU mode when CUDA is unavailable.\n'
-            "\n"
-            "Strategy: temporarily set gpuid: '' in configs.yaml before running\n"
-            "run.py so SepReformer uses its own CPU fallback path, then restore\n"
-            "the original file in a finally block. This avoids all torch.device\n"
-            "subclassing / monkey-patching issues (torch.device is an unsubclassable\n"
-            'C type; replacing it breaks isinstance checks inside PyTorch itself)."""\n'
-            "import runpy, sys, re as _re, torch as _torch\n"
-            "from pathlib import Path\n"
-            "\n"
-            "# (path, original_text) pairs to restore after run\n"
-            "_restores = []\n"
+            '"""CPU shim: patch torch.load for GPU-saved checkpoints, then run."""\n'
+            "import runpy, sys, torch as _torch\n"
             "\n"
             "if not _torch.cuda.is_available():\n"
-            "    # Patch every configs.yaml under models/ that has a numeric gpuid.\n"
-            "    # With gpuid: '' SepReformer creates torch.device('cpu') instead\n"
-            "    # of torch.device('cuda', 0), so no tensor/parameter ever touches CUDA.\n"
-            "    for _cfg in Path('models').rglob('configs.yaml'):\n"
-            "        try:\n"
-            "            _orig = _cfg.read_text(encoding='utf-8')\n"
-            "            _new = _re.sub(r\"(gpuid\\s*:\\s*)'[0-9]+'\", r\"\\1''\", _orig)\n"
-            "            if _new != _orig:\n"
-            "                _cfg.write_text(_new, encoding='utf-8')\n"
-            "                _restores.append((_cfg, _orig))\n"
-            "        except Exception:\n"
-            "            pass\n"
-            "\n"
-            "    # Belt-and-suspenders: also redirect map_location in torch.load\n"
-            "    # for any checkpoint that was originally saved on a GPU device.\n"
             "    _orig_load = _torch.load\n"
             "    def _cpu_load(f, map_location=None, **kwargs):\n"
-            "        if map_location is None:\n"
-            "            map_location = 'cpu'\n"
-            "        elif isinstance(map_location, _torch.device) and map_location.type == 'cuda':\n"
-            "            map_location = 'cpu'\n"
-            "        elif isinstance(map_location, str) and map_location.startswith('cuda'):\n"
+            "        if map_location is None or (\n"
+            "            isinstance(map_location, _torch.device) and map_location.type == 'cuda'\n"
+            "        ) or (isinstance(map_location, str) and map_location.startswith('cuda')):\n"
             "            map_location = 'cpu'\n"
             "        # weights_only=False: SepReformer checkpoints contain optimizer/scheduler\n"
-            "        # state (non-weight Python objects); torch 2.6+ defaulted to True which\n"
-            "        # breaks loading these checkpoints.\n"
+            "        # state; torch 2.6+ defaults to True which breaks loading.\n"
             "        kwargs.setdefault('weights_only', False)\n"
             "        return _orig_load(f, map_location=map_location, **kwargs)\n"
             "    _torch.load = _cpu_load\n"
             "\n"
-            "try:\n"
-            "    sys.argv[0] = 'run.py'\n"
-            "    runpy.run_path('run.py', run_name='__main__')\n"
-            "finally:\n"
-            "    for _cfg, _orig in _restores:\n"
-            "        try:\n"
-            "            _cfg.write_text(_orig, encoding='utf-8')\n"
-            "        except Exception:\n"
-            "            pass\n",
+            "sys.argv[0] = 'run.py'\n"
+            "runpy.run_path('run.py', run_name='__main__')\n",
             encoding="utf-8",
         )
 
     def _patch_py39_compat(self) -> None:
-        """Replace @dataclass(slots=...) → @dataclass() in SepReformer source.
+        """Apply source-level patches to SepReformer for compatibility.
 
-        The slots= parameter was added in Python 3.10. Removing it has no
-        effect on correctness — it only disables the memory-layout optimisation.
+        1. CPU device patch — SepReformer unconditionally creates a CUDA device:
+               gpuid = tuple(map(int, config["engine"]["gpuid"].split(',')))
+               device = torch.device(f'cuda:{gpuid[0]}')
+           Replace with a fallback that uses CPU when CUDA is unavailable.
+           (Setting gpuid:'' in configs.yaml doesn't work — int('') → ValueError.)
+
+        2. slots= patch (Python 3.9) — strip @dataclass(slots=True/False) since
+           the slots= kwarg was added in Python 3.10.
+
+        Both patches are idempotent (safe to re-run).
         """
-        # Always (re)write the CPU wrapper so it's present regardless of Python version.
-        if SEPREFORMER_DIR.exists():
-            self._write_cpu_wrapper()
+        if not SEPREFORMER_DIR.exists():
+            return
 
-        import sys as _sys
-        if _sys.version_info >= (3, 10):
-            return  # slots patch not needed on 3.10+
+        # Always (re)write the CPU wrapper.
+        self._write_cpu_wrapper()
+
         import re as _re
+
+        # --- Source-level CPU device patch ---
+        _CUDA_DEVICE_OLD = (
+            "gpuid = tuple(map(int, config[\"engine\"][\"gpuid\"].split(',')))\n"
+            "    device = torch.device(f'cuda:{gpuid[0]}')"
+        )
+        _CUDA_DEVICE_NEW = (
+            "_gpuid_str = config[\"engine\"][\"gpuid\"]\n"
+            "    if torch.cuda.is_available() and _gpuid_str.strip():\n"
+            "        gpuid = tuple(map(int, _gpuid_str.split(',')))\n"
+            "        device = torch.device(f'cuda:{gpuid[0]}')\n"
+            "    else:\n"
+            "        gpuid = (0,)\n"
+            "        device = torch.device('cpu')"
+        )
+
         for py_file in SEPREFORMER_DIR.rglob("*.py"):
             try:
                 text = py_file.read_text(encoding="utf-8")
-                if "slots=" not in text:
-                    continue
-                # Python 3.9 doesn't support the slots= kwarg at all (True or False).
-                # Strip it from every @dataclass(...) call, handling mixed args too:
-                #   @dataclass(slots=True)           → @dataclass()
-                #   @dataclass(slots=False, eq=True) → @dataclass(eq=True)
-                #   @dataclass(eq=True, slots=True)  → @dataclass(eq=True)
-                patched = _re.sub(r',\s*slots=(?:True|False)', '', text)
-                patched = _re.sub(r'slots=(?:True|False),\s*', '', patched)
-                patched = _re.sub(r'\(slots=(?:True|False)\)', '()', patched)
-                if patched != text:
-                    py_file.write_text(patched, encoding="utf-8")
+                changed = False
+
+                # CPU device patch — replace hard-coded CUDA device creation
+                if _CUDA_DEVICE_OLD in text:
+                    text = text.replace(_CUDA_DEVICE_OLD, _CUDA_DEVICE_NEW)
+                    changed = True
+
+                # slots= patch (Python 3.9 compat)
+                if "slots=" in text:
+                    import sys as _sys
+                    if _sys.version_info < (3, 10):
+                        patched = _re.sub(r',\s*slots=(?:True|False)', '', text)
+                        patched = _re.sub(r'slots=(?:True|False),\s*', '', patched)
+                        patched = _re.sub(r'\(slots=(?:True|False)\)', '()', patched)
+                        if patched != text:
+                            text = patched
+                            changed = True
+
+                if changed:
+                    py_file.write_text(text, encoding="utf-8")
             except Exception:
                 pass
 
