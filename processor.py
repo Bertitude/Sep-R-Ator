@@ -135,9 +135,9 @@ class SepReformerProcessor:
         )
 
     def _patch_py39_compat(self) -> None:
-        """Replace @dataclass(slots=True) → @dataclass() in SepReformer source.
+        """Replace @dataclass(slots=...) → @dataclass() in SepReformer source.
 
-        The slots=True parameter was added in Python 3.10. Removing it has no
+        The slots= parameter was added in Python 3.10. Removing it has no
         effect on correctness — it only disables the memory-layout optimisation.
         """
         # Always (re)write the CPU wrapper so it's present regardless of Python version.
@@ -147,14 +147,22 @@ class SepReformerProcessor:
         import sys as _sys
         if _sys.version_info >= (3, 10):
             return  # slots patch not needed on 3.10+
+        import re as _re
         for py_file in SEPREFORMER_DIR.rglob("*.py"):
             try:
                 text = py_file.read_text(encoding="utf-8")
-                if "slots=True" in text:
-                    py_file.write_text(
-                        text.replace("@dataclass(slots=True)", "@dataclass()"),
-                        encoding="utf-8",
-                    )
+                if "slots=" not in text:
+                    continue
+                # Python 3.9 doesn't support the slots= kwarg at all (True or False).
+                # Strip it from every @dataclass(...) call, handling mixed args too:
+                #   @dataclass(slots=True)           → @dataclass()
+                #   @dataclass(slots=False, eq=True) → @dataclass(eq=True)
+                #   @dataclass(eq=True, slots=True)  → @dataclass(eq=True)
+                patched = _re.sub(r',\s*slots=(?:True|False)', '', text)
+                patched = _re.sub(r'slots=(?:True|False),\s*', '', patched)
+                patched = _re.sub(r'\(slots=(?:True|False)\)', '()', patched)
+                if patched != text:
+                    py_file.write_text(patched, encoding="utf-8")
             except Exception:
                 pass
 
