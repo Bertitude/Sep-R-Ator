@@ -61,6 +61,7 @@ class SepReformerProcessor:
     def ensure_installed(self, progress_cb=None) -> None:
         """Clone SepReformer and install its dependencies if not present."""
         if self.is_installed():
+            self._patch_py39_compat()  # safe to re-run; no-op if already patched
             return
 
         if progress_cb:
