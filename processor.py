@@ -35,9 +35,6 @@ SEPREFORMER_REPO = "https://github.com/dmlguq456/SepReformer"
 # SepReformer_Base_WSJ0 operates at 8 kHz (WSJ0 dataset standard)
 MODEL_SR = 8000
 
-# Formats torchaudio can load that are NOT WAV — need intermediate WAV for these
-_NON_WAV_SUFFIXES = {".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".aiff", ".aif"}
-
 
 # ---------------------------------------------------------------------------
 # Processor class
@@ -88,7 +85,7 @@ class SepReformerProcessor:
             "pandas>=1.5.0",
             "scikit-learn>=1.1.0",
             "ptflops>=0.7",
-            "thop>=0.1",
+            "ultralytics-thop>=2.0",  # actively maintained fork of unmaintained thop
             "torchinfo>=1.7",
             "tensorboard>=2.10",
             "tqdm>=4.60.0",

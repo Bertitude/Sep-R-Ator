@@ -183,12 +183,11 @@ class App(ctk.CTk):
             row=1, column=2, padx=(0, 12), pady=6
         )
 
-        # Speakers
+        # Speakers — SepReformer_Base_WSJ0 is a 2-source model; label is informational only
         ctk.CTkLabel(tab, text="Speakers:").grid(row=2, column=0, sticky="w", padx=12, pady=6)
-        self._a_spk_var = ctk.StringVar(value="2")
-        ctk.CTkSegmentedButton(
-            tab, values=["2", "3"], variable=self._a_spk_var, width=120
-        ).grid(row=2, column=1, sticky="w", pady=6)
+        ctk.CTkLabel(tab, text="2  (model maximum)", text_color="gray").grid(
+            row=2, column=1, sticky="w", pady=6
+        )
 
         # Process button
         self._a_btn = ctk.CTkButton(
@@ -202,6 +201,7 @@ class App(ctk.CTk):
 
         self._a_file: str | None = None
         self._a_outdir: str | None = None
+
 
     # ---- Tab B -----------------------------------------------------------
 
@@ -268,13 +268,11 @@ class App(ctk.CTk):
             self._show_error("Please select an output folder.")
             return
 
-        n_spk = int(self._a_spk_var.get())
         self._run_in_thread(
             self._a_btn,
             self.processor.separate,
             self._a_file,
             self._a_outdir,
-            n_spk,
         )
 
     # ------------------------------------------------------------------
@@ -327,11 +325,17 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _on_device_change(self, value: str) -> None:
-        mapping = {"Auto": "auto", "CPU": "cpu", "GPU": "cuda"}
-        self.processor.device = mapping.get(value, "auto")
-        if value == "GPU" and not __import__("torch").cuda.is_available():
-            self._show_error("No CUDA GPU detected — falling back to CPU.")
+        import torch as _torch
+        if value == "GPU":
+            if _torch.cuda.is_available():
+                self.processor.device = "cuda"
+            else:
+                self._show_error("No CUDA GPU detected — falling back to CPU.")
+                self.processor.device = "cpu"
+        elif value == "CPU":
             self.processor.device = "cpu"
+        else:  # Auto
+            self.processor.device = "cuda" if _torch.cuda.is_available() else "cpu"
 
     # ------------------------------------------------------------------
     # Generic threaded runner
