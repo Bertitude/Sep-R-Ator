@@ -90,6 +90,7 @@ class SepReformerProcessor:
             "thop>=0.1",
             "torchinfo>=1.7",
             "tensorboard>=2.10",
+            "tqdm>=4.60.0",
         ]
         subprocess.run(
             [sys.executable, "-m", "pip", "install"] + _SEPREFORMER_DEPS,
