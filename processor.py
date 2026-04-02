@@ -17,10 +17,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
+# Suppress torchaudio's "will change to torchcodec in 2.9" deprecation notice —
+# the old API continues to work; we'll migrate when the change actually lands.
+warnings.filterwarnings(
+    "ignore",
+    message=".*torchaudio.load_with_torchcodec.*",
+    category=UserWarning,
+)
 import torchaudio
 
 # ---------------------------------------------------------------------------
@@ -143,6 +151,10 @@ class SepReformerProcessor:
             "            map_location = 'cpu'\n"
             "        elif isinstance(map_location, str) and map_location.startswith('cuda'):\n"
             "            map_location = 'cpu'\n"
+            "        # weights_only=False: SepReformer checkpoints contain optimizer/scheduler\n"
+            "        # state (non-weight Python objects); torch 2.6+ defaulted to True which\n"
+            "        # breaks loading these checkpoints.\n"
+            "        kwargs.setdefault('weights_only', False)\n"
             "        return _orig_load(f, map_location=map_location, **kwargs)\n"
             "    _torch.load = _cpu_load\n"
             "\n"

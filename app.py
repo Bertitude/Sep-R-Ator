@@ -46,6 +46,7 @@ class SetupDialog(ctk.CTkToplevel):
         self.geometry("420x180")
         self.resizable(False, False)
         self.grab_set()
+        self.lift()  # prevents white-flash on Windows dark mode (customtkinter #2469)
         self.protocol("WM_DELETE_WINDOW", lambda: None)  # prevent close
 
         ctk.CTkLabel(
