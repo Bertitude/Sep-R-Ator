@@ -176,6 +176,9 @@ class SepReformerProcessor:
         for py_file in SEPREFORMER_DIR.rglob("*.py"):
             try:
                 text = py_file.read_text(encoding="utf-8")
+                # Normalise CRLF → LF so searches work on Windows checkouts.
+                # We write back with LF; Python on Windows handles LF fine.
+                text = text.replace("\r\n", "\n")
                 changed = False
 
                 # CPU device patch — replace hard-coded CUDA device creation
