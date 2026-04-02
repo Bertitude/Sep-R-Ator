@@ -417,6 +417,7 @@ class App(ctk.CTk):
 
     def _maybe_setup(self) -> None:
         if self.processor.is_installed():
+            self.processor._patch_py39_compat()  # no-op on 3.10+; fixes slots=True on 3.9
             self._set_status("Ready.")
             return
 
