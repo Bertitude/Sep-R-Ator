@@ -363,11 +363,9 @@ class App(ctk.CTk):
 
         def worker():
             try:
-                # Pass a progress callback that posts status updates to the UI thread
-                def cb(msg: str):
-                    self.after(0, lambda m=msg: self._set_status(m))
+                def cb(msg: str, fraction=None):
+                    self.after(0, lambda m=msg, f=fraction: self._set_progress(m, f))
 
-                # Append the callback as the last argument
                 result = fn(*args, cb)
                 self.after(0, lambda r=result: self._on_done(r))
             except Exception as exc:
@@ -391,6 +389,14 @@ class App(ctk.CTk):
             self._progress.stop()
             self._progress.configure(mode="determinate")
             self._progress.set(1)
+
+    def _set_progress(self, msg: str, fraction=None) -> None:
+        """Update status text and, if fraction is given, switch bar to determinate."""
+        self._status_label.configure(text=msg, text_color="gray")
+        if fraction is not None:
+            self._progress.stop()
+            self._progress.configure(mode="determinate")
+            self._progress.set(max(0.0, min(1.0, fraction)))
 
     def _set_status(self, msg: str, color: str = "gray") -> None:
         self._status_label.configure(text=msg, text_color=color)

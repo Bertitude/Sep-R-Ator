@@ -291,7 +291,7 @@ class SepReformerProcessor:
             chunk = waveform[:, start:end]
 
             if progress_cb:
-                progress_cb(f"Separating chunk {i + 1}/{n_chunks}…")
+                progress_cb(f"Separating chunk {i + 1}/{n_chunks}…", (i + 1) / n_chunks)
 
             chunk_wav = input_wav.parent / f"{input_wav.stem}_chunk{i:04d}.wav"
             torchaudio.save(str(chunk_wav), chunk.float(), sr)
@@ -426,20 +426,31 @@ class SepReformerProcessor:
 
         result_paths: list[str] = []
 
+        n_tracks = len(track_paths)
         for idx, track_path in enumerate(track_paths):
             track_path = Path(track_path)
+            track_base = idx / n_tracks
+            track_span = 1.0 / n_tracks
             if progress_cb:
                 progress_cb(
-                    f"Processing track {idx + 1}/{len(track_paths)}: {track_path.name}…"
+                    f"Processing track {idx + 1}/{n_tracks}: {track_path.name}…",
+                    track_base,
                 )
 
             original_waveform, original_sr = self._load_audio(track_path)
+
+            # Wrap the callback so chunk-level fractions are scaled into this
+            # track's slice of the overall 0→1 progress range.
+            def _inner_cb(msg, frac=None, _base=track_base, _span=track_span):
+                if progress_cb:
+                    overall = (_base + frac * _span) if frac is not None else None
+                    progress_cb(msg, overall)
 
             with tempfile.TemporaryDirectory(prefix=f"sepr_b{idx}_") as tmpdir:
                 tmp_dir = Path(tmpdir)
                 input_wav = self._prepare_input(track_path, tmp_dir)
 
-                sep_wavs = self._run_sepreformer(input_wav, progress_cb=None)
+                sep_wavs = self._run_sepreformer(input_wav, progress_cb=_inner_cb)
 
                 # Pick the separated output that best correlates with the input
                 # (= the primary speaker on this mic)
