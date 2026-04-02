@@ -160,11 +160,11 @@ class SepReformerProcessor:
 
         # --- Source-level CPU device patch ---
         _CUDA_DEVICE_OLD = (
-            "gpuid = tuple(map(int, config[\"engine\"][\"gpuid\"].split(',')))\n"
+            "    gpuid = tuple(map(int, config[\"engine\"][\"gpuid\"].split(',')))\n"
             "    device = torch.device(f'cuda:{gpuid[0]}')"
         )
         _CUDA_DEVICE_NEW = (
-            "_gpuid_str = config[\"engine\"][\"gpuid\"]\n"
+            "    _gpuid_str = config[\"engine\"][\"gpuid\"]\n"
             "    if torch.cuda.is_available() and _gpuid_str.strip():\n"
             "        gpuid = tuple(map(int, _gpuid_str.split(',')))\n"
             "        device = torch.device(f'cuda:{gpuid[0]}')\n"
