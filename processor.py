@@ -74,11 +74,25 @@ class SepReformerProcessor:
         if progress_cb:
             progress_cb("Installing SepReformer dependencies…")
 
+        # Install inference-only deps rather than SepReformer's pinned requirements.txt,
+        # which contains exact CUDA/Linux-specific pins (e.g. networkx==3.4.1) that
+        # don't resolve on Windows or non-CUDA systems.
+        _SEPREFORMER_DEPS = [
+            "librosa>=0.10.0",
+            "soxr>=0.3.0",
+            "scipy>=1.10.0",
+            "loguru>=0.6.0",
+            "mir-eval>=0.7",
+            "matplotlib>=3.6.0",
+            "pandas>=1.5.0",
+            "scikit-learn>=1.1.0",
+            "ptflops>=0.7",
+            "thop>=0.1",
+            "torchinfo>=1.7",
+            "tensorboard>=2.10",
+        ]
         subprocess.run(
-            [
-                sys.executable, "-m", "pip", "install",
-                "-r", str(SEPREFORMER_DIR / "requirements.txt"),
-            ],
+            [sys.executable, "-m", "pip", "install"] + _SEPREFORMER_DEPS,
             check=True,
         )
 
