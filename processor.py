@@ -97,6 +97,29 @@ class SepReformerProcessor:
             check=True,
         )
 
+        # Patch Python 3.9 compatibility: @dataclass(slots=True) requires 3.10+
+        self._patch_py39_compat()
+
+    def _patch_py39_compat(self) -> None:
+        """Replace @dataclass(slots=True) → @dataclass() in SepReformer source.
+
+        The slots=True parameter was added in Python 3.10. Removing it has no
+        effect on correctness — it only disables the memory-layout optimisation.
+        """
+        import sys as _sys
+        if _sys.version_info >= (3, 10):
+            return  # not needed on 3.10+
+        for py_file in SEPREFORMER_DIR.rglob("*.py"):
+            try:
+                text = py_file.read_text(encoding="utf-8")
+                if "slots=True" in text:
+                    py_file.write_text(
+                        text.replace("@dataclass(slots=True)", "@dataclass()"),
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
+
         if progress_cb:
             progress_cb("Setup complete.")
 
