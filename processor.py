@@ -107,29 +107,39 @@ class SepReformerProcessor:
         self._patch_py39_compat()
 
     def _write_cpu_wrapper(self) -> None:
-        """Write a small shim into SepReformer/ for CPU-only torch.load safety.
-
-        The heavy lifting (device creation) is handled by the source-level
-        patch in _patch_py39_compat(). This wrapper only needs to ensure
-        GPU-saved checkpoints load onto CPU via a torch.load redirect.
-        """
+        """Write a CPU shim into SepReformer/ that handles all CUDA call sites."""
         wrapper = SEPREFORMER_DIR / "_sep_r_ator_cpu_wrapper.py"
         wrapper.write_text(
-            '"""CPU shim: patch torch.load for GPU-saved checkpoints, then run."""\n'
+            '"""CPU shim: redirect all CUDA operations to CPU when CUDA is unavailable."""\n'
             "import runpy, sys, torch as _torch\n"
             "\n"
             "if not _torch.cuda.is_available():\n"
+            "    # 1. torch.load: map GPU-saved checkpoints onto CPU.\n"
             "    _orig_load = _torch.load\n"
             "    def _cpu_load(f, map_location=None, **kwargs):\n"
             "        if map_location is None or (\n"
             "            isinstance(map_location, _torch.device) and map_location.type == 'cuda'\n"
             "        ) or (isinstance(map_location, str) and map_location.startswith('cuda')):\n"
             "            map_location = 'cpu'\n"
-            "        # weights_only=False: SepReformer checkpoints contain optimizer/scheduler\n"
-            "        # state; torch 2.6+ defaults to True which breaks loading.\n"
             "        kwargs.setdefault('weights_only', False)\n"
             "        return _orig_load(f, map_location=map_location, **kwargs)\n"
             "    _torch.load = _cpu_load\n"
+            "\n"
+            "    # 2. data_parallel: SepReformer always calls data_parallel(model, input,\n"
+            "    #    device_ids=gpuid) even in inference mode. When CUDA is unavailable\n"
+            "    #    and device_ids contains any GPU id, PyTorch raises:\n"
+            "    #      RuntimeError: device type could not be determined\n"
+            "    #    Patch it to run the model directly on CPU instead.\n"
+            "    import torch.nn.parallel as _par\n"
+            "    def _cpu_data_parallel(module, inputs, device_ids=None,\n"
+            "                           output_device=None, dim=0, module_kwargs=None):\n"
+            "        if module_kwargs is None:\n"
+            "            module_kwargs = {}\n"
+            "        if not isinstance(inputs, tuple):\n"
+            "            inputs = (inputs,)\n"
+            "        return module(*inputs, **module_kwargs)\n"
+            "    _par.data_parallel = _cpu_data_parallel\n"
+            "    _torch.nn.parallel.data_parallel = _cpu_data_parallel\n"
             "\n"
             "sys.argv[0] = 'run.py'\n"
             "runpy.run_path('run.py', run_name='__main__')\n",
