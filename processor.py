@@ -256,26 +256,73 @@ class SepReformerProcessor:
     # SepReformer subprocess
     # ------------------------------------------------------------------
 
+    # SepReformer's positional encoding builds an N×N matrix (N = audio frames).
+    # At 8 kHz with stride=16, 10 s → 5 k frames → 100 MB.  Beyond ~20 s the
+    # matrix grows into GB territory; a 23-min podcast track needs ~1.8 TB.
+    # Split long audio into chunks and concatenate outputs.
+    _MAX_CHUNK_SECS: int = 10
+
     def _run_sepreformer(self, input_wav: Path, progress_cb=None) -> list[Path]:
         """
-        Run SepReformer inference on input_wav (must live inside a temp dir).
+        Run SepReformer on input_wav, automatically chunking long audio.
 
-        SepReformer writes its outputs next to the input file:
-            {stem}_out_0.wav, {stem}_out_1.wav
-
-        Returns a sorted list of those output paths.
+        Long files are split into _MAX_CHUNK_SECS segments, processed
+        individually, then concatenated.  Returns sorted output paths.
         """
         if progress_cb:
             progress_cb("Running SepReformer separation…")
 
+        info = torchaudio.info(str(input_wav))
+        duration = info.num_frames / info.sample_rate
+
+        if duration <= self._MAX_CHUNK_SECS:
+            return self._run_sepreformer_file(input_wav)
+
+        # Long audio — chunk, process, concatenate
+        waveform, sr = torchaudio.load(str(input_wav))
+        chunk_samples = int(self._MAX_CHUNK_SECS * sr)
+        total_samples = waveform.shape[-1]
+        n_chunks = (total_samples + chunk_samples - 1) // chunk_samples
+
+        all_chunk_outputs: list[list[Path]] = []
+        for i in range(n_chunks):
+            start = i * chunk_samples
+            end = min(start + chunk_samples, total_samples)
+            chunk = waveform[:, start:end]
+
+            if progress_cb:
+                progress_cb(f"Separating chunk {i + 1}/{n_chunks}…")
+
+            chunk_wav = input_wav.parent / f"{input_wav.stem}_chunk{i:04d}.wav"
+            torchaudio.save(str(chunk_wav), chunk.float(), sr)
+            try:
+                all_chunk_outputs.append(self._run_sepreformer_file(chunk_wav))
+            finally:
+                chunk_wav.unlink(missing_ok=True)
+
+        # Concatenate per-speaker outputs across all chunks
+        n_spk = len(all_chunk_outputs[0])
+        final_paths: list[Path] = []
+        for spk_idx in range(n_spk):
+            parts: list[torch.Tensor] = []
+            out_sr = MODEL_SR
+            for chunk_outs in all_chunk_outputs:
+                w, out_sr = torchaudio.load(str(chunk_outs[spk_idx]))
+                parts.append(w)
+                chunk_outs[spk_idx].unlink(missing_ok=True)
+            combined = torch.cat(parts, dim=-1)
+            out_path = input_wav.parent / f"{input_wav.stem}_out_{spk_idx}.wav"
+            torchaudio.save(str(out_path), combined.float(), out_sr)
+            final_paths.append(out_path)
+
+        return sorted(final_paths)
+
+    def _run_sepreformer_file(self, input_wav: Path) -> list[Path]:
+        """Invoke SepReformer subprocess on a single (short) WAV file."""
         env = os.environ.copy()
         if self.device == "cpu":
-            # Prevent CUDA use even if a GPU is present
             env["CUDA_VISIBLE_DEVICES"] = ""
 
-        # Use the CPU wrapper when device is CPU so that SepReformer's hard-coded
-        # cuda:0 device (from configs.yaml gpuid:'0') is transparently redirected
-        # to CPU — avoids AssertionError on CPU-only PyTorch builds.
         entry_script = (
             "_sep_r_ator_cpu_wrapper.py"
             if self.device == "cpu"
