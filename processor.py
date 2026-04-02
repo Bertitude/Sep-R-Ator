@@ -169,7 +169,7 @@ class SepReformerProcessor:
             "        gpuid = tuple(map(int, _gpuid_str.split(',')))\n"
             "        device = torch.device(f'cuda:{gpuid[0]}')\n"
             "    else:\n"
-            "        gpuid = (0,)\n"
+            "        gpuid = ()  # empty → data_parallel calls module directly (CPU path)\n"
             "        device = torch.device('cpu')"
         )
 
