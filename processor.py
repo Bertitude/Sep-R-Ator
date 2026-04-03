@@ -161,16 +161,20 @@ class SepReformerProcessor:
             '"""\n'
             "import json, os, sys, torch as _torch\n"
             "\n"
-            "if not _torch.cuda.is_available():\n"
-            "    _orig_load = _torch.load\n"
-            "    def _cpu_load(f, map_location=None, **kwargs):\n"
+            "# Always patch torch.load: SepReformer checkpoints need weights_only=False.\n"
+            "# Also redirect CUDA map_location to CPU when CUDA is unavailable.\n"
+            "_orig_load = _torch.load\n"
+            "def _patched_load(f, map_location=None, **kwargs):\n"
+            "    if not _torch.cuda.is_available():\n"
             "        if map_location is None or (\n"
             "            isinstance(map_location, _torch.device) and map_location.type == 'cuda'\n"
             "        ) or (isinstance(map_location, str) and map_location.startswith('cuda')):\n"
             "            map_location = 'cpu'\n"
-            "        kwargs.setdefault('weights_only', False)\n"
-            "        return _orig_load(f, map_location=map_location, **kwargs)\n"
-            "    _torch.load = _cpu_load\n"
+            "    kwargs.setdefault('weights_only', False)\n"
+            "    return _orig_load(f, map_location=map_location, **kwargs)\n"
+            "_torch.load = _patched_load\n"
+            "\n"
+            "if not _torch.cuda.is_available():\n"
             "    import torch.nn.parallel as _par\n"
             "    def _cpu_data_parallel(module, inputs, device_ids=None,\n"
             "                           output_device=None, dim=0, module_kwargs=None):\n"
@@ -187,11 +191,19 @@ class SepReformerProcessor:
             "if not _files:\n"
             "    sys.exit(0)\n"
             "\n"
+            "# Signal that startup has begun — parent shows 'Loading…' status.\n"
+            "print('LOADING', flush=True)\n"
+            "\n"
             "from argparse import Namespace as _NS\n"
             "import yaml as _yaml\n"
             "from models.SepReformer_Base_WSJ0.model import Model as _Model\n"
             "from models.SepReformer_Base_WSJ0.engine import Engine as _Engine\n"
-            "from utils import util_implement as _ui\n"
+            "from utils import util_engine as _ue, util_implement as _ui\n"
+            "\n"
+            "# model_params_mac_summary runs 3 profiling forward-passes at startup\n"
+            "# (ptflops / thop / torchinfo) which adds ~30-60 s before the first chunk.\n"
+            "# We don't need it for inference.\n"
+            "_ue.model_params_mac_summary = lambda **kwargs: None\n"
             "\n"
             "_yaml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),\n"
             "                           'models', 'SepReformer_Base_WSJ0', 'configs.yaml')\n"
@@ -423,17 +435,22 @@ class SepReformerProcessor:
         def _drain_stderr():
             for line in proc.stderr:
                 stderr_lines.append(line)
-        threading.Thread(target=_drain_stderr, daemon=True).start()
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
 
         for line in proc.stdout:
             line = line.strip()
-            if line.startswith("CHUNK:"):
+            if line == "LOADING":
+                if progress_cb:
+                    progress_cb("Loading SepReformer model…")
+            elif line.startswith("CHUNK:"):
                 parts = line.split(":")
                 i, n = int(parts[1]), int(parts[2])
                 if progress_cb:
                     progress_cb(f"Separating chunk {i}/{n}…", i / n)
 
         proc.wait()
+        stderr_thread.join(timeout=5)
         manifest_path.unlink(missing_ok=True)
 
         if proc.returncode != 0:
