@@ -81,7 +81,7 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Sep-R-Ator")
-        self.geometry("700x560")
+        self.geometry("700x640")
         self.resizable(False, False)
 
         self.processor = SepReformerProcessor(device="auto")
