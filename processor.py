@@ -410,11 +410,14 @@ class SepReformerProcessor:
         Remove crosstalk bleed from a set of per-mic tracks.
 
         For each mic track:
-          1. Load it (any format; WAV copied, others decoded).
-          2. Feed it directly to SepReformer to separate the dominant speaker
-             from the bleed.
-          3. Keep the separated output most correlated with the original track
-             (= primary speaker, least bleed).
+          1. Feed it to SepReformer to separate its two components.
+          2. Identify which separated output is the bleed by comparing against
+             the OTHER mic tracks: the output most correlated with another mic's
+             content IS the bleed — keep the other one.
+
+        Cross-track comparison is more reliable than same-track correlation
+        because the bleed is by definition the same signal present in another
+        mic, making it directly identifiable.
 
         Returns a list of output file paths (one per input track).
         """
@@ -424,23 +427,32 @@ class SepReformerProcessor:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        result_paths: list[str] = []
+        # Pre-load all originals at MODEL_SR for cross-track comparison.
+        # Using a common rate avoids length-mismatch issues in corrcoef.
+        if progress_cb:
+            progress_cb("Loading tracks for analysis…", 0.0)
+        originals_8k: list[np.ndarray] = []
+        original_srs: list[int] = []
+        for tp in track_paths:
+            wf, sr = self._load_audio(tp)
+            original_srs.append(sr)
+            originals_8k.append(self._resample(wf, sr, MODEL_SR).squeeze().numpy())
 
+        result_paths: list[str] = []
         n_tracks = len(track_paths)
+
         for idx, track_path in enumerate(track_paths):
             track_path = Path(track_path)
             track_base = idx / n_tracks
             track_span = 1.0 / n_tracks
+            original_sr = original_srs[idx]
+
             if progress_cb:
                 progress_cb(
                     f"Processing track {idx + 1}/{n_tracks}: {track_path.name}…",
                     track_base,
                 )
 
-            original_waveform, original_sr = self._load_audio(track_path)
-
-            # Wrap the callback so chunk-level fractions are scaled into this
-            # track's slice of the overall 0→1 progress range.
             def _inner_cb(msg, frac=None, _base=track_base, _span=track_span):
                 if progress_cb:
                     overall = (_base + frac * _span) if frac is not None else None
@@ -449,33 +461,36 @@ class SepReformerProcessor:
             with tempfile.TemporaryDirectory(prefix=f"sepr_b{idx}_") as tmpdir:
                 tmp_dir = Path(tmpdir)
                 input_wav = self._prepare_input(track_path, tmp_dir)
-
                 sep_wavs = self._run_sepreformer(input_wav, progress_cb=_inner_cb)
 
-                # Pick the separated output that best correlates with the input
-                # (= the primary speaker on this mic)
-                orig_np = original_waveform.squeeze().numpy()
+                # Cross-track picker: the separated output that correlates most
+                # with OTHER mics is the bleed — keep the one with lowest
+                # average cross-track correlation.
+                other_nps = [originals_8k[i] for i in range(n_tracks) if i != idx]
 
                 best_idx = 0
-                best_corr = -2.0
+                best_score = float("inf")
 
                 for si, sep_wav in enumerate(sep_wavs):
-                    sw, sep_sr = torchaudio.load(str(sep_wav))
-                    sw = self._resample(sw, sep_sr, original_sr)
-                    sw_np = sw.squeeze().numpy()
+                    sw_np = torchaudio.load(str(sep_wav))[0].squeeze().numpy()
 
-                    min_len = min(len(orig_np), len(sw_np))
-                    if min_len < 2:
-                        continue
-                    corr = float(
-                        np.corrcoef(orig_np[:min_len], sw_np[:min_len])[0, 1]
-                    )
-                    if corr > best_corr:
-                        best_corr = corr
+                    cross_total = 0.0
+                    n_compared = 0
+                    for other_np in other_nps:
+                        min_len = min(len(sw_np), len(other_np))
+                        if min_len < 2:
+                            continue
+                        c = float(np.corrcoef(sw_np[:min_len], other_np[:min_len])[0, 1])
+                        if not np.isnan(c):
+                            cross_total += c
+                            n_compared += 1
+
+                    score = cross_total / n_compared if n_compared > 0 else 0.0
+                    if score < best_score:
+                        best_score = score
                         best_idx = si
 
-                best_wav_path = sep_wavs[best_idx]
-                best_waveform, best_sr = torchaudio.load(str(best_wav_path))
+                best_waveform, best_sr = torchaudio.load(str(sep_wavs[best_idx]))
                 best_waveform = self._resample(best_waveform, best_sr, original_sr)
 
                 out_path = output_dir / f"{track_path.stem}_clean.wav"
