@@ -81,7 +81,7 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Sep-R-Ator")
-        self.geometry("700x640")
+        self.geometry("700x720")
         self.resizable(False, False)
 
         self.processor = SepReformerProcessor(device="auto")
@@ -136,7 +136,7 @@ class App(ctk.CTk):
         self._device_status.pack(side="left", padx=(6, 0))
 
         # Tab view
-        self._tabs = ctk.CTkTabview(self, width=660, height=320)
+        self._tabs = ctk.CTkTabview(self, width=660, height=260)
         self._tabs.pack(padx=20, pady=12, fill="both")
 
         self._tabs.add("Separate Mixed File")
@@ -149,16 +149,35 @@ class App(ctk.CTk):
         bottom = ctk.CTkFrame(self, corner_radius=8)
         bottom.pack(padx=20, pady=(0, 16), fill="x")
 
+        # Stage pipeline indicators
+        _STAGE_NAMES = ["Prepare", "Load Model", "Separate", "Save", "Done"]
+        stages_row = ctk.CTkFrame(bottom, fg_color="transparent")
+        stages_row.pack(anchor="w", padx=14, pady=(10, 2))
+        self._stage_labels: dict[str, ctk.CTkLabel] = {}
+        for i, name in enumerate(_STAGE_NAMES):
+            lbl = ctk.CTkLabel(
+                stages_row,
+                text=name,
+                font=ctk.CTkFont(size=11),
+                text_color="gray",
+            )
+            lbl.pack(side="left")
+            self._stage_labels[name] = lbl
+            if i < len(_STAGE_NAMES) - 1:
+                ctk.CTkLabel(
+                    stages_row, text=" › ", font=ctk.CTkFont(size=11), text_color="#444"
+                ).pack(side="left")
+
         self._status_label = ctk.CTkLabel(
             bottom, text="Ready.", font=ctk.CTkFont(size=12), text_color="gray"
         )
-        self._status_label.pack(anchor="w", padx=14, pady=(10, 2))
+        self._status_label.pack(anchor="w", padx=14, pady=(2, 2))
 
         self._progress = ctk.CTkProgressBar(bottom, mode="indeterminate")
         self._progress.pack(fill="x", padx=14, pady=(0, 6))
         self._progress.set(0)
 
-        self._result_frame = ctk.CTkScrollableFrame(bottom, height=80, label_text="Output Files")
+        self._result_frame = ctk.CTkScrollableFrame(bottom, height=120, label_text="Output Files")
         self._result_frame.pack(fill="x", padx=14, pady=(0, 10))
 
         self._open_btn = ctk.CTkButton(
@@ -217,14 +236,16 @@ class App(ctk.CTk):
 
     def _build_tab_b(self, tab: ctk.CTkFrame) -> None:
         tab.grid_columnconfigure(0, weight=1)
+        # Row 1 must not expand — keep the track list at a fixed height
+        tab.grid_rowconfigure(1, weight=0)
 
         # Track list
         ctk.CTkLabel(tab, text="Mic tracks (one per speaker):").grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(16, 4)
+            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 2)
         )
 
-        self._b_listbox_frame = ctk.CTkScrollableFrame(tab, height=90)
-        self._b_listbox_frame.grid(row=1, column=0, padx=(12, 4), pady=4, sticky="ew")
+        self._b_listbox_frame = ctk.CTkScrollableFrame(tab, height=60)
+        self._b_listbox_frame.grid(row=1, column=0, padx=(12, 4), pady=(0, 4), sticky="ew")
 
         btn_col = ctk.CTkFrame(tab, fg_color="transparent")
         btn_col.grid(row=1, column=1, padx=(0, 12), pady=4, sticky="n")
@@ -390,9 +411,40 @@ class App(ctk.CTk):
             self._progress.configure(mode="determinate")
             self._progress.set(1)
 
+    # Maps lowercase substrings in status messages → stage name
+    _STAGE_MAP = [
+        ("done —",          "Done"),
+        ("saving",          "Save"),
+        ("separating chunk","Separate"),
+        ("running seprefor","Separate"),
+        ("loading seprefor","Load Model"),
+        ("preparing",       "Prepare"),
+        ("loading tracks",  "Prepare"),
+        ("loading audio",   "Prepare"),
+    ]
+
+    def _set_stage(self, active: str, *, done: bool = False) -> None:
+        order = list(self._stage_labels.keys())
+        active_idx = order.index(active) if active in order else -1
+        for i, name in enumerate(order):
+            lbl = self._stage_labels[name]
+            if done:
+                lbl.configure(text_color="#6BCB77", font=ctk.CTkFont(size=11))
+            elif i < active_idx:
+                lbl.configure(text_color="#6BCB77", font=ctk.CTkFont(size=11))
+            elif i == active_idx:
+                lbl.configure(text_color="white", font=ctk.CTkFont(size=11, weight="bold"))
+            else:
+                lbl.configure(text_color="gray", font=ctk.CTkFont(size=11))
+
     def _set_progress(self, msg: str, fraction=None) -> None:
-        """Update status text and, if fraction is given, switch bar to determinate."""
+        """Update status text, stage indicators, and optionally the progress bar."""
         self._status_label.configure(text=msg, text_color="gray")
+        msg_l = msg.lower()
+        for keyword, stage in self._STAGE_MAP:
+            if keyword in msg_l:
+                self._set_stage(stage)
+                break
         if fraction is not None:
             self._progress.stop()
             self._progress.configure(mode="determinate")
@@ -409,8 +461,11 @@ class App(ctk.CTk):
             widget.destroy()
         self._open_btn.configure(state="disabled")
         self._last_output_dir = None
+        for lbl in self._stage_labels.values():
+            lbl.configure(text_color="gray", font=ctk.CTkFont(size=11))
 
     def _on_done(self, output_paths: list[str]) -> None:
+        self._set_stage("Done", done=True)
         self._set_status(f"Done — {len(output_paths)} file(s) saved.", color="#6BCB77")
 
         for path in output_paths:
