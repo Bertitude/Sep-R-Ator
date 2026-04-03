@@ -12,11 +12,13 @@ SepReformer writes outputs to the same directory as the input sample:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import warnings
 from pathlib import Path
 
@@ -146,6 +148,80 @@ class SepReformerProcessor:
             encoding="utf-8",
         )
 
+    def _write_batch_wrapper(self) -> None:
+        """Write the batch inference wrapper into SepReformer/.
+
+        Loads the model once and processes every file in a JSON manifest,
+        reporting progress as 'CHUNK:i:n' lines on stdout.
+        """
+        wrapper = SEPREFORMER_DIR / "_sep_r_ator_batch.py"
+        wrapper.write_text(
+            '"""Batch SepReformer inference — load model once, run all chunks.\n'
+            "Sep-R-Ator uses this instead of invoking run.py per-chunk.\n"
+            '"""\n'
+            "import json, os, sys, torch as _torch\n"
+            "\n"
+            "if not _torch.cuda.is_available():\n"
+            "    _orig_load = _torch.load\n"
+            "    def _cpu_load(f, map_location=None, **kwargs):\n"
+            "        if map_location is None or (\n"
+            "            isinstance(map_location, _torch.device) and map_location.type == 'cuda'\n"
+            "        ) or (isinstance(map_location, str) and map_location.startswith('cuda')):\n"
+            "            map_location = 'cpu'\n"
+            "        kwargs.setdefault('weights_only', False)\n"
+            "        return _orig_load(f, map_location=map_location, **kwargs)\n"
+            "    _torch.load = _cpu_load\n"
+            "    import torch.nn.parallel as _par\n"
+            "    def _cpu_data_parallel(module, inputs, device_ids=None,\n"
+            "                           output_device=None, dim=0, module_kwargs=None):\n"
+            "        if module_kwargs is None:\n"
+            "            module_kwargs = {}\n"
+            "        if not isinstance(inputs, tuple):\n"
+            "            inputs = (inputs,)\n"
+            "        return module(*inputs, **module_kwargs)\n"
+            "    _par.data_parallel = _cpu_data_parallel\n"
+            "    _torch.nn.parallel.data_parallel = _cpu_data_parallel\n"
+            "\n"
+            "with open(sys.argv[1]) as _f:\n"
+            "    _files = json.load(_f)\n"
+            "if not _files:\n"
+            "    sys.exit(0)\n"
+            "\n"
+            "from argparse import Namespace as _NS\n"
+            "import yaml as _yaml\n"
+            "from models.SepReformer_Base_WSJ0.model import Model as _Model\n"
+            "from models.SepReformer_Base_WSJ0.engine import Engine as _Engine\n"
+            "from utils import util_implement as _ui\n"
+            "\n"
+            "_yaml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),\n"
+            "                           'models', 'SepReformer_Base_WSJ0', 'configs.yaml')\n"
+            "with open(_yaml_path) as _f:\n"
+            "    _cfg = _yaml.safe_load(_f)['config']\n"
+            "\n"
+            "_args = _NS(engine_mode='infer_sample', out_wav_dir=None,\n"
+            "            sample_file=None, model='SepReformer_Base_WSJ0')\n"
+            "_gpuid_str = _cfg['engine']['gpuid']\n"
+            "if _torch.cuda.is_available() and _gpuid_str.strip():\n"
+            "    _gpuid = tuple(map(int, _gpuid_str.split(',')))\n"
+            "    _device = _torch.device(f'cuda:{_gpuid[0]}')\n"
+            "else:\n"
+            "    _gpuid = ()\n"
+            "    _device = _torch.device('cpu')\n"
+            "\n"
+            "_model = _Model(**_cfg['model'])\n"
+            "_crit = _ui.CriterionFactory(_cfg['criterion'], _device).get_criterions()\n"
+            "_opt  = _ui.OptimizerFactory(_cfg['optimizer'], _model.parameters()).get_optimizers()\n"
+            "_sch  = _ui.SchedulerFactory(_cfg['scheduler'], _opt).get_schedulers()\n"
+            "_engine = _Engine(_args, _cfg, _model, {}, _crit, _opt, _sch, _gpuid, _device)\n"
+            "\n"
+            "_n = len(_files)\n"
+            "for _i, _path in enumerate(_files, 1):\n"
+            "    print(f'CHUNK:{_i}:{_n}', flush=True)\n"
+            "    _engine._inference_sample(_path)\n"
+            "print('DONE', flush=True)\n",
+            encoding="utf-8",
+        )
+
     def _patch_py39_compat(self) -> None:
         """Apply source-level patches to SepReformer for compatibility.
 
@@ -163,8 +239,9 @@ class SepReformerProcessor:
         if not SEPREFORMER_DIR.exists():
             return
 
-        # Always (re)write the CPU wrapper.
+        # Always (re)write the wrappers.
         self._write_cpu_wrapper()
+        self._write_batch_wrapper()
 
         import re as _re
 
@@ -266,8 +343,10 @@ class SepReformerProcessor:
         """
         Run SepReformer on input_wav, automatically chunking long audio.
 
-        Long files are split into _MAX_CHUNK_SECS segments, processed
-        individually, then concatenated.  Returns sorted output paths.
+        Short files (≤ _MAX_CHUNK_SECS) are processed with a single subprocess.
+        Long files are split into chunks, all written to disk first, then processed
+        in ONE subprocess via the batch wrapper (model loads once for all chunks).
+        Returns sorted output paths.
         """
         if progress_cb:
             progress_cb("Running SepReformer separation…")
@@ -278,27 +357,25 @@ class SepReformerProcessor:
         if duration <= self._MAX_CHUNK_SECS:
             return self._run_sepreformer_file(input_wav)
 
-        # Long audio — chunk, process, concatenate
+        # Long audio — write all chunks first, then batch-process in one subprocess.
         waveform, sr = torchaudio.load(str(input_wav))
         chunk_samples = int(self._MAX_CHUNK_SECS * sr)
         total_samples = waveform.shape[-1]
         n_chunks = (total_samples + chunk_samples - 1) // chunk_samples
 
-        all_chunk_outputs: list[list[Path]] = []
+        chunk_wavs: list[Path] = []
         for i in range(n_chunks):
             start = i * chunk_samples
             end = min(start + chunk_samples, total_samples)
-            chunk = waveform[:, start:end]
-
-            if progress_cb:
-                progress_cb(f"Separating chunk {i + 1}/{n_chunks}…", (i + 1) / n_chunks)
-
             chunk_wav = input_wav.parent / f"{input_wav.stem}_chunk{i:04d}.wav"
-            torchaudio.save(str(chunk_wav), chunk.float(), sr)
-            try:
-                all_chunk_outputs.append(self._run_sepreformer_file(chunk_wav))
-            finally:
-                chunk_wav.unlink(missing_ok=True)
+            torchaudio.save(str(chunk_wav), waveform[:, start:end].float(), sr)
+            chunk_wavs.append(chunk_wav)
+
+        try:
+            all_chunk_outputs = self._run_sepreformer_batch(chunk_wavs, progress_cb)
+        finally:
+            for cw in chunk_wavs:
+                cw.unlink(missing_ok=True)
 
         # Concatenate per-speaker outputs across all chunks
         n_spk = len(all_chunk_outputs[0])
@@ -316,6 +393,63 @@ class SepReformerProcessor:
             final_paths.append(out_path)
 
         return sorted(final_paths)
+
+    def _run_sepreformer_batch(self, chunk_wavs: list[Path], progress_cb=None) -> list[list[Path]]:
+        """Process multiple WAV files in one subprocess — model loads once.
+
+        Writes a JSON manifest, spawns _sep_r_ator_batch.py, reads 'CHUNK:i:n'
+        progress lines from stdout, then collects the per-chunk output paths.
+        """
+        manifest_path = chunk_wavs[0].parent / "_sep_r_ator_manifest.json"
+        manifest_path.write_text(
+            json.dumps([str(p) for p in chunk_wavs]), encoding="utf-8"
+        )
+
+        env = os.environ.copy()
+        if self.device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+
+        proc = subprocess.Popen(
+            [sys.executable, "_sep_r_ator_batch.py", str(manifest_path)],
+            cwd=str(SEPREFORMER_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Drain stderr in a background thread to prevent pipe-buffer deadlock.
+        stderr_lines: list[str] = []
+        def _drain_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("CHUNK:"):
+                parts = line.split(":")
+                i, n = int(parts[1]), int(parts[2])
+                if progress_cb:
+                    progress_cb(f"Separating chunk {i}/{n}…", i / n)
+
+        proc.wait()
+        manifest_path.unlink(missing_ok=True)
+
+        if proc.returncode != 0:
+            tail = "".join(stderr_lines[-30:])
+            raise RuntimeError(f"SepReformer batch inference failed:\n{tail}")
+
+        all_outputs: list[list[Path]] = []
+        for chunk_wav in chunk_wavs:
+            stem = chunk_wav.stem
+            outputs = sorted(chunk_wav.parent.glob(f"{stem}_out_*.wav"))
+            if not outputs:
+                raise RuntimeError(
+                    f"SepReformer produced no output for {chunk_wav.name}"
+                )
+            all_outputs.append(outputs)
+        return all_outputs
 
     def _run_sepreformer_file(self, input_wav: Path) -> list[Path]:
         """Invoke SepReformer subprocess on a single (short) WAV file."""
